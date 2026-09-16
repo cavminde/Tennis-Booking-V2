@@ -40,10 +40,12 @@
     ⇒ 不能只看 HTTP 状态码，必须看 body 的 code。
 ================================================================================
 """
+import base64
 import hashlib
 import json
 import os
 import random
+import re
 import secrets
 import threading
 import time
@@ -67,6 +69,11 @@ PATH_GETDAY = '/app/order/detail/getDay'
 PATH_SUBMIT = '/app/order/master/submitOrder'
 PATH_MY_ORDERS = '/app/order/detail/list'
 
+# 2026-09-16 从 H5 前端扒出的登录入口（与小程序同一后端，无需微信、无需抓包）
+#   Fk = e => Ze.post("/login", e)   → {username, password, loginType:"01"}
+PATH_LOGIN = '/login'
+PATH_GETINFO = '/getInfo'
+
 PRODUCT_ID = '2721318797597070029'
 
 # 【需求1】一次只能订 1 小时 —— 硬锁 60，不接受外部覆盖
@@ -77,6 +84,13 @@ UA = (
     'Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI '
     'MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) '
     'UnifiedPCWindowsWechat(0xf2541b37) XWEB/20089 miniProgram/wx559b66d8c8ed12ec'
+)
+
+# CAS 必须用**普通浏览器** UA：带 MicroMessenger/miniProgram 的话，
+# 统一身份认证会返回另一套页面（拿不到 pwdEncryptSalt）。
+UA_BROWSER = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
 )
 
 WEEKDAY_CN = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
@@ -417,6 +431,205 @@ def api_getday(session, token, sku, d, timeout=DEFAULT_TIMEOUT):
         if it.get('serviceDate') == d and it.get('serviceTime'):
             occ.add(it['serviceTime'])
     return occ, r.status_code, data
+
+
+def build_anon_headers():
+    """登录用：不带 Authorization。"""
+    h = build_headers('')
+    h.pop('Authorization', None)
+    return h
+
+
+def extract_token(data):
+    """从登录响应里挖 token（不同后端放的位置不一样，逐个试）。"""
+    if not isinstance(data, dict):
+        return None
+    d = data.get('data')
+
+    def g(o, k):
+        return o.get(k) if isinstance(o, dict) else None
+
+    for v in (g(d, 'token'), d if isinstance(d, str) else None,
+              g(data, 'token'), g(d, 'access_token'), g(data, 'access_token'),
+              g(d, 'Authorization'), g(d, 'loginUserKey')):
+        if isinstance(v, str) and len(v) >= 30:
+            return v.strip()
+    # 兜底：整个响应里找长得像 JWT 的串
+    m = re.search(r'eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}',
+                  json.dumps(data, ensure_ascii=False))
+    return m.group(0) if m else None
+
+
+# ---------------------------------------------------------------------------
+# CAS 统一身份认证（authserver.hainanu.edu.cn）
+# ---------------------------------------------------------------------------
+# 协议（2026-09-16 从登录页 + encrypt.js + login.js 逆向）
+#   1. GET  /authserver/login?service=<service>  拿 JSESSIONID + execution + pwdEncryptSalt
+#   2. 密码加密：AES-CBC/PKCS7，key = pwdEncryptSalt，iv = 随机16字符，
+#      明文 = 随机64字符 + 密码（encrypt.js: encryptAES）
+#   3. POST /authserver/login (form-urlencoded)：
+#      username / password(密文) / lt(空) / execution / cllt=userNameLogin /
+#      dllt=generalLogin / _eventId=submit / rememberMe
+#   4. 成功 → 302，Location 里带 szblTK=<token>（H5 前端直接拿它当 token）
+#      若账号开了多因子认证 → 302 到 reAuthCheck/reAuthLoginView.do?isMultifactor=true
+# ---------------------------------------------------------------------------
+
+AUTH_BASE = 'https://authserver.hainanu.edu.cn'
+CAS_LOGIN_PATH = '/authserver/login'
+CAS_SERVICE = 'https://hdscs.hainanu.edu.cn/hdsc/app/'
+AES_CHARS = 'ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678'
+
+MFA_REQUIRED = 'MFA_REQUIRED'
+
+
+def _cas_rand(n):
+    return ''.join(random.choice(AES_CHARS) for _ in range(n))
+
+
+def _cas_encrypt_password(password: str, salt: str) -> str:
+    """复现 encrypt.js 的 encryptPassword()。"""
+    try:
+        from cryptography.hazmat.primitives import padding as _pad
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except Exception:
+        return password
+    data = (_cas_rand(64) + password).encode('utf-8')
+    p = _pad.PKCS7(128).padder()
+    buf = p.update(data) + p.finalize()
+    enc = Cipher(algorithms.AES(salt.encode('utf-8')),
+                 modes.CBC(_cas_rand(16).encode('utf-8'))).encryptor()
+    return base64.b64encode(enc.update(buf) + enc.finalize()).decode()
+
+
+def api_cas_login(username, password, timeout=15):
+    """学号 + 门户密码 → token。
+
+    返回 (token, err, extra)
+      token  成功时是 token 字符串
+      err    None 成功；MFA_REQUIRED 表示需要多因子认证；其它为错误信息
+      extra  附加信息（如 MFA 页面地址）
+    """
+    if not username or not password:
+        return None, '请填学号和密码', None
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({'User-Agent': UA_BROWSER,
+                            'Accept': 'text/html,application/xhtml+xml,*/*',
+                            'Accept-Language': 'zh-CN,zh;q=0.9'})
+    url = AUTH_BASE + CAS_LOGIN_PATH + '?service=' + CAS_SERVICE
+    try:
+        r = session.get(url, timeout=timeout)
+        html = r.text
+    except Exception as e:
+        return None, f'打不开统一身份认证页：{e}', None
+
+    m_salt = (re.search(r'id="pwdEncryptSalt"\s+value="([^"]*)"', html)
+              or re.search(r"id='pwdEncryptSalt'\s+value='([^']*)'", html)
+              or re.search(r'pwdEncryptSalt"\s+value="([^"]*)"', html))
+    m_exec = (re.search(r'id="execution"\s+name="execution"\s+value="([^"]*)"', html)
+              or re.search(r'name="execution"\s+value="([^"]*)"', html))
+    if not m_salt:
+        return None, '登录页拿不到加密盐（页面结构可能变了）', None
+    salt = m_salt.group(1)
+    execution = m_exec.group(1) if m_exec else 'e1s1'
+
+    payload = {
+        'username': str(username),
+        'password': _cas_encrypt_password(str(password), salt),
+        'lt': '',
+        'execution': execution,
+        'cllt': 'userNameLogin',
+        'dllt': 'generalLogin',
+        '_eventId': 'submit',
+        'rememberMe': 'true',
+    }
+    try:
+        resp = session.post(AUTH_BASE + CAS_LOGIN_PATH, data=payload, timeout=timeout,
+                            allow_redirects=False,
+                            headers={'Content-Type': 'application/x-www-form-urlencoded',
+                                     'Referer': url})
+    except Exception as e:
+        return None, f'提交登录失败：{e}', None
+
+    loc = resp.headers.get('Location', '') or ''
+    m = re.search(r'szblTK=([A-Za-z0-9._\-]+)', loc)
+    if m:
+        return m.group(1), None, None
+
+    if 'reAuth' in loc or 'multifactor' in loc.lower():
+        return None, MFA_REQUIRED, {'url': loc, 'hint':
+            '账号开了多因子认证。可去 CAS「个人中心/偏好设置」关闭，之后即可全自动登录。'}
+
+    # 没跳走 → 登录失败，页面里有原因
+    try:
+        txt = re.sub(r'<script.*?</script>', ' ', resp.text, flags=re.S | re.I)
+        txt = re.sub(r'<style.*?</style>', ' ', txt, flags=re.S | re.I)
+        txt = re.sub(r'<[^>]+>', ' ', txt)
+        txt = re.sub(r'\s+', ' ', txt).strip()
+    except Exception:
+        txt = ''
+    for kw in ('验证码', '密码错误', '用户名或密码错误', '不存在', '锁定', '激活', '过期'):
+        if kw in txt:
+            i = txt.find(kw)
+            return None, txt[max(0, i - 30): i + 50].strip(), None
+    return None, (txt[:120] or f'登录失败（HTTP {resp.status_code}）'), None
+
+
+def api_login(username, password, login_type='01', timeout=12):
+    """学号 + 密码 → token。不需要微信、不需要抓包、不需要证书。
+
+    接口来自 H5 前端：`POST /login  {username, password, loginType:"01"}`
+    （与小程序同一后端 hdscs.hainanu.edu.cn，token 通用）
+    """
+    if not username or not password:
+        return None, '请填用户名和密码'
+    session = requests.Session()
+    session.verify = False
+    try:
+        r = session.post(BASE_URL + PATH_LOGIN, headers=build_anon_headers(),
+                         json={'username': str(username), 'password': str(password),
+                               'loginType': str(login_type or '01')},
+                         timeout=timeout)
+        data = r.json()
+    except Exception as e:
+        return None, f'请求失败：{e}'
+    code = data.get('code') if isinstance(data, dict) else None
+    msg = (data.get('msg') or '') if isinstance(data, dict) else ''
+    if code not in (200, '200', 0, '0'):
+        return None, msg or f'登录失败（code={code}）'
+    tok = extract_token(data)
+    if not tok:
+        return None, '登录成功，但响应里没找到 token 字段：' + brief(data, 160)
+    return tok, None
+
+
+def api_getinfo(token, timeout=10):
+    """拉用户信息，可用来确认 token 归属。"""
+    session = requests.Session()
+    session.verify = False
+    try:
+        r = session.get(BASE_URL + PATH_GETINFO, headers=build_headers(token),
+                        timeout=timeout)
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def verify_token(token, d=None, timeout=10):
+    """验证 token 是否有效：调 getDay（受保护接口，能读即有效）。"""
+    session = requests.Session()
+    session.verify = False
+    d = d or (date_cls.today() + timedelta(days=2)).isoformat()
+    try:
+        occ, status, data = api_getday(session, token, COURTS_FALLBACK[0]['sku'],
+                                       d, timeout=timeout)
+    except Exception as e:
+        return False, f'验证请求失败：{e}'
+    if status == 401 or (isinstance(data, dict) and data.get('code') == 401):
+        return False, 'token 无效（401 认证失败）'
+    if status == 200:
+        return True, '有效'
+    return False, f'未预期响应：HTTP {status} {brief(data, 100)}'
 
 
 def api_submit(session, token, sku, d, t, timeout=DEFAULT_TIMEOUT):

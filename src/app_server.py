@@ -28,6 +28,14 @@ from urllib.parse import urlparse
 
 import booker as b
 
+try:
+    import tokencap as tc
+    HAS_TC = True
+except Exception as _e:
+    tc = None
+    HAS_TC = False
+    _TC_ERR = str(_e)
+
 HOST = '127.0.0.1'
 PORT = 8081
 
@@ -41,6 +49,11 @@ else:
 STATE = {'running': False, 'log': [], 'result': None, 'task': None}
 _LOCK = threading.Lock()
 _STOP = threading.Event()
+
+# 抓包状态
+CAP = {'active': False, 'token': None, 'error': None, 'port': None,
+       'ca_ready': False, 'proxy': None, 'cap_obj': None}
+_CAP_LOCK = threading.Lock()
 
 
 def append_log(msg):
@@ -99,7 +112,9 @@ def spawn(kind, params):
         _STOP.clear()
         t0 = time.time()
         try:
-            if kind == 'preview':
+            if kind == 'capture':
+                res = run_capture(params)
+            elif kind == 'preview':
                 params['submit'] = False
                 res = b.run_booking(params, log=append_log, stop=lambda: _STOP.is_set())
             elif kind == 'bench':
@@ -120,6 +135,62 @@ def spawn(kind, params):
             STATE['running'] = False
 
     threading.Thread(target=runner, daemon=True).start()
+
+
+def run_capture(params):
+    """抓包任务：装证书 → 设代理 → 等 token → 复原。"""
+    if not HAS_TC:
+        append_log(f'× 抓包模块不可用：{_TC_ERR}')
+        return {'success': False, 'error': _TC_ERR}
+    timeout = int(params.get('capture_timeout') or 300)
+    port = int(params.get('capture_port') or tc.DEFAULT_PORT)
+    with _CAP_LOCK:
+        CAP.update(active=True, token=None, error=None, port=port)
+
+    workdir = os.path.join(os.path.dirname(CONFIG_PATH), '.tokencap')
+    try:
+        cap = tc.TokenCapture(workdir, port=port, log=append_log)
+        with _CAP_LOCK:
+            CAP['cap_obj'] = cap
+
+        append_log('[1/4] 准备本地证书…')
+        if not cap.prepare():
+            with _CAP_LOCK:
+                CAP.update(active=False, error='证书未安装')
+            return {'success': False, 'error': '证书未安装（需要点确认框的【是】）'}
+
+        append_log('[2/4] 启动本地代理…')
+        if not cap.start():
+            with _CAP_LOCK:
+                CAP.update(active=False, error='代理启动失败')
+            return {'success': False, 'error': '代理启动失败'}
+
+        append_log(f'[3/4] 等待小程序发请求（最多 {timeout} 秒）…')
+        append_log('      → 现在去微信里打开海大场地小程序，随便点两下')
+        tok = cap.wait(timeout=timeout, poll=0.3)
+
+        if tok:
+            append_log(f'✓ 抓到 token（{len(tok)} 字符，前 24 位 {tok[:24]}…）')
+            write_config({'token': tok})
+            append_log('✓ 已自动写入 config.json')
+            ok, why = b.verify_token(tok)
+            append_log(f'  校验：{why}')
+            with _CAP_LOCK:
+                CAP.update(active=False, token=tok, error=None)
+            return {'success': True, 'token': tok, 'valid': ok, 'why': why}
+        with _CAP_LOCK:
+            CAP.update(active=False, error='超时未抓到')
+        append_log('× 超时，没抓到。确认小程序里有实际的网络请求。')
+        return {'success': False, 'error': '超时未抓到'}
+    finally:
+        append_log('[4/4] 复原系统代理…')
+        try:
+            if CAP.get('cap_obj'):
+                CAP['cap_obj'].stop(restore=True)
+        except Exception:
+            pass
+        with _CAP_LOCK:
+            CAP.update(active=False, cap_obj=None)
 
 
 def load_page():
@@ -181,6 +252,16 @@ class Handler(BaseHTTPRequestHandler):
                             'result': STATE['result'], 'task': STATE['task']})
         elif path == '/api/config':
             self._json(read_config())
+        elif path == '/api/capture/status':
+            st = {'has_module': HAS_TC}
+            if HAS_TC:
+                st['ca_installed'] = tc.ca_installed()
+                en, sv = tc.get_proxy()
+                st['proxy'] = sv if en else ''
+            with _CAP_LOCK:
+                st.update({'active': CAP['active'], 'port': CAP['port'],
+                           'error': CAP['error'], 'has_token': bool(CAP['token'])})
+            self._json(st)
         elif path == '/api/fingerprint':
             q = self._q()
             rs = b.RandomSource(os.path.join(os.path.dirname(CONFIG_PATH),
@@ -212,6 +293,76 @@ class Handler(BaseHTTPRequestHandler):
                                 passphrase=payload.get('passphrase') or '')
             rs.reset_salt()
             self._json({'ok': True, 'fingerprint': rs.fingerprint})
+            return
+
+        # ---- 以下接口不占用「抢单任务」的互斥锁 ----
+        if path == '/api/login':
+            username = (payload.get('username') or '').strip()
+            password = payload.get('password') or ''
+            login_type = (payload.get('loginType') or '01').strip()
+            if not username or not password:
+                self._json({'ok': False, 'msg': '请填用户名和密码'})
+                return
+            tok, err = b.api_login(username, password, login_type)
+            if not tok:
+                self._json({'ok': False, 'msg': err or '登录失败'})
+                return
+            ok, why = b.verify_token(tok)
+            if ok:
+                write_config({'token': tok})
+            self._json({'ok': True, 'token': tok, 'valid': ok, 'why': why,
+                        'preview': tok[:24] + '…'})
+            return
+
+        # 统一身份认证（CAS）—— 这才是学号+门户密码该走的入口
+        if path == '/api/caslogin':
+            username = (payload.get('username') or '').strip()
+            password = payload.get('password') or ''
+            if not username or not password:
+                self._json({'ok': False, 'msg': '请填学号和密码'})
+                return
+            tok, err, extra = b.api_cas_login(username, password)
+            if err == b.MFA_REQUIRED:
+                self._json({'ok': False, 'mfa': True,
+                            'msg': '需要多因子认证：' + (extra or {}).get('hint', '')})
+                return
+            if not tok:
+                self._json({'ok': False, 'msg': err or 'CAS 登录失败'})
+                return
+            ok, why = b.verify_token(tok)
+            if ok:
+                write_config({'token': tok})
+            self._json({'ok': True, 'token': tok, 'valid': ok, 'why': why,
+                        'preview': tok[:24] + '…'})
+            return
+
+        if path == '/api/capture/stop':
+            with _CAP_LOCK:
+                cap = CAP.get('cap_obj')
+            if cap:
+                append_log('  收到停止信号，正在复原…')
+                cap.stop(restore=True)
+            _STOP.set()
+            self._json({'ok': True})
+            return
+
+        if path == '/api/ca/remove':
+            if not HAS_TC:
+                self._json({'ok': False, 'msg': '模块不可用'})
+                return
+            ok = tc.uninstall_ca(log=append_log)
+            self._json({'ok': ok})
+            return
+
+        if path == '/api/ca/install':
+            if not HAS_TC:
+                self._json({'ok': False, 'msg': '模块不可用：' + str(_TC_ERR)})
+                return
+            workdir = os.path.join(os.path.dirname(CONFIG_PATH), '.tokencap')
+            ca = tc.CertAuthority(workdir)
+            ca.ensure_ca()
+            ok = tc.install_ca(ca.ca_cert_path, log=append_log)
+            self._json({'ok': ok, 'fingerprint': ca.fingerprint})
             return
 
         if busy and path != '/api/stop':
@@ -250,6 +401,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/api/diagnose':
             STATE['task'] = '有效性检测'
             spawn('diagnose', params_from(payload))
+        elif path == '/api/capture':
+            STATE['task'] = '抓 token'
+            spawn('capture', params_from(payload))
         else:
             self.send_error(404)
             return

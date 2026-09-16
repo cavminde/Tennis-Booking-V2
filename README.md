@@ -1,6 +1,90 @@
 # 海大网球订场 V2
 
-相对 V1 的六项改造，逐条对应你提的需求。
+相对 V1 的六项改造，逐条对应你提的需求。**V2.1 新增：Token 自动获取（内置抓包，不再需要 Fiddler）。**
+
+---
+
+## 零、Token 自动获取（V2.1）
+
+页面上有两个入口，优先用方式一。
+
+### 方式一 · 学号密码直接登录（最简单）
+
+填学号 + 密码 → 点「🔑 登录并获取 token」。
+
+走的是 H5 前端同款接口 `POST https://hdscs.hainanu.edu.cn/login`，
+参数 `{username, password, loginType:"01"}`，与小程序**同一个后端**，token 通用。
+
+- 不需要微信、不需要抓包、不需要证书
+- 密码只用于这一次请求，**不保存**
+- 失败会直接显示服务端原话（如「用户不存在/密码错误」）
+
+### ⚠ 这个 /login 不是 CAS，门户是另一个
+
+| 入口 | 地址 | 用的账号 |
+|---|---|---|
+| 统采统购平台（H5） | `https://hdscw.hainanu.edu.cn` | 打开后**自动跳 CAS** |
+| **CAS 统一身份认证** | `https://authserver.hainanu.edu.cn/authserver/login` | 学号 + **门户密码**，首次需激活 |
+| 平台自有账号接口 | `POST https://hdscs.hainanu.edu.cn/login` | 平台账号，**与 CAS 不是一套** |
+
+实测结论：
+
+- `handleLogin` 的源码是
+  `async function r(l){ const {token:c} = await Fk(l); e.value=c; await i() }`
+  ⇒ **password 明文传输，响应里 `token` 在顶层**，不存在"我们加密方式不对"的问题。
+- 学号 + 门户密码 POST 到 `/login` 会返回 **「用户不存在/密码错误」** ——
+  因为这个接口校验的是平台自有账号，CAS 登录页原话是
+  「学生为学号，教工为工号，**首次使用需进行账号激活**」。
+- hdscw **没有 SPA fallback**：只有 `/` 是 200，`/login`、`/login/pwd`、
+  `/home` 全 404。所以浏览器打开后走的是前端路由 `/login`，
+  而该页逻辑是无 token 就跳 CAS —— 你到不了那个账号密码页。
+
+**推荐路径**：浏览器打开 `https://hdscw.hainanu.edu.cn` → 自动跳 CAS →
+学号密码登录（必要时先激活）。**配合下面的 MITM 抓包，登录的同时 token 就到手了**，
+不依赖 `/login` 认不认你的密码。
+
+另有 `GET /ecard/login/<id>` 一卡通登录入口。
+
+### 方式二 · 内置 MITM 抓包（不用装 Fiddler）
+
+原理和 Fiddler 完全一样，只是内置了：
+
+1. 自签一个本地 CA，装进**当前用户**的受信任根存储
+2. 系统代理临时指向 `127.0.0.1:8899`
+3. 微信小程序走系统代理 → 我们解密 → 从 `Authorization` 头里拿 token
+4. 抓到后自动复原系统代理、把 token 写进配置
+
+**操作步骤**
+
+1. 先**关掉 Fiddler / Clash 等代理软件** —— 它们会持续把系统代理抢回去
+   （页面右上角会显示当前代理，如果不是 `8899` 且带 ⚠ 就是被占了）
+2. 点「安装证书」→ 弹出 Windows 确认框，**点【是】**（没看到去任务栏找）
+3. 点「📡 开始抓包」
+4. 去微信打开场地小程序，随便点两下
+5. 抓到后自动停止并复原，token 自动填好
+
+**安全边界**
+
+- 只解密 `hdscs.hainanu.edu.cn` 和 `hdscw.hainanu.edu.cn`，其余流量原样转发
+- 只读 `Authorization` 头，不记录请求体、不修改任何数据
+- 不碰微信进程、不做注入，无封号风险
+- 超时或异常一律复原系统代理
+
+**可行性依据**：你用 Fiddler 抓到过明文请求，说明 PC 版微信小程序走系统代理且
+信任系统根证书 —— Fiddler 做的事和这个模块完全一样。
+已通过自闭环测试：拦截 → 动态证书 → 解密 → 捕获 token → 白名单外直连 → 端口释放。
+
+**局限**
+
+- 装证书必须手动点一次【是】（Windows 的安全设计，防恶意软件静默装根证书）
+- 如果 Fiddler/Clash 在跑，代理设置可能被它们覆盖
+
+### 为什么不用「读本地存储」
+
+实测排除了：小程序数据目录
+`%APPDATA%\Tencent\xwechat\radium\users\<uid>\applet\local\wx559b66d8c8ed12ec\`
+下的 `usrmmkvstorage*` 是 **MMKV 且已加密**（可打印率 2%，全文件扫不到 JWT），
+`__APP__.wxapkg` 头是 `V1MM`（微信 PC 版加密包），也解不开。
 
 ---
 
@@ -144,7 +228,8 @@ Tennis Booking V2/
 │  ├─ app_server.py   本地服务（端口 8081）
 │  ├─ index.html      前端（拖动排序在这里）
 │  ├─ selftest.py     离线自检，改逻辑后跑一遍
-│  └─ config.json     配置（含 token）
+│  └─ config.json     配置（含 token，已被 .gitignore 排除，不入库）
+├─ config.example.json  配置模板：复制为 src/config.json 后填入 token
 ├─ build.bat          打包成 exe
 └─ README.md
 ```

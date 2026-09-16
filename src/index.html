@@ -124,6 +124,43 @@ details summary:hover{color:var(--accent)}
         <div class="hint">放号规则：每天 08:00 开放「今天+2天」。订场直接扣校园卡，无二次确认。</div>
       </div>
 
+      <!-- Token 自动获取 -->
+      <div class="card" style="border-color:#2f3a1f">
+        <h2 style="color:#c8f560">Token 自动获取</h2>
+        <div class="bar" style="margin-bottom:6px">
+          <span class="badge" id="caBadge">证书：检测中</span>
+          <span class="badge" id="proxyBadge">代理：--</span>
+        </div>
+
+        <label>方式一 · 学号 + 门户密码登录（统一身份认证 CAS）</label>
+        <div class="row">
+          <div><input type="text" id="luser" placeholder="学号 / 工号"></div>
+          <div><input type="password" id="lpwd" placeholder="门户密码"></div>
+        </div>
+        <div class="btns"><button class="pri" id="btnLogin">🔑 登录并获取 token</button></div>
+        <div class="hint">走 <code>authserver.hainanu.edu.cn</code> 的 CAS，密码本地 AES 加密后提交。
+          密码只用于这一次请求，<b>不会保存</b>。
+          <br><span style="color:var(--warn)">若提示「需要多因子认证」：说明账号开了 MFA。
+          可去 CAS 的<b>个人中心 / 偏好设置</b>里关掉多因子认证（页面原话：属于可选行为），
+          之后即可全自动登录。</span>
+        </div>
+
+        <label style="margin-top:14px">方式二 · 抓包（学号密码不可用时）</label>
+        <div class="btns">
+          <button id="btnCap">📡 开始抓包</button>
+          <button class="dan" id="btnCapStop">■ 停止抓包</button>
+          <button id="btnCaInst" style="font-size:12px;padding:6px 12px">安装证书</button>
+          <button id="btnCaDel" style="font-size:12px;padding:6px 12px">移除证书</button>
+        </div>
+        <div class="hint">
+          ① 首次会弹 Windows 证书确认框，<b>点【是】</b>（没看到就去任务栏找）<br>
+          ② 系统代理临时指向本机 <b>127.0.0.1:8899</b><br>
+          ③ 去微信打开场地小程序，随便点两下<br>
+          ④ 抓到后自动复原代理、填入 token<br>
+          只解密 <code>hdscs/hdscw</code> 两个域名，其余流量原样转发。
+        </div>
+      </div>
+
       <!-- 时间窗口 -->
       <div class="card">
         <h2>时间窗口（只订 1 小时）</h2>
@@ -377,7 +414,7 @@ async function start(path, extra){
 }
 function begin(){
   $('dot').classList.add('on');
-  ['goNow','goSched','preview','bench','diag','resalt'].forEach(id=>$(id).disabled=true);
+  ['goNow','goSched','preview','bench','diag','resalt','btnCap'].forEach(id=>$(id).disabled=true);
   $('log').innerHTML='';
   if(polling) clearInterval(polling);
   polling = setInterval(poll, 700);
@@ -397,9 +434,10 @@ async function poll(){
     box.scrollTop = box.scrollHeight;
   }
   $('stat').textContent = s.running ? `运行中：${s.task||''}` : '空闲';
+  refreshCapStatus();
   if(!s.running){
     $('dot').classList.remove('on');
-    ['goNow','goSched','preview','bench','diag','resalt'].forEach(id=>$(id).disabled=false);
+    ['goNow','goSched','preview','bench','diag','resalt','btnCap'].forEach(id=>$(id).disabled=false);
     clearInterval(polling); polling=null;
     if(s.result) renderResult(s.result);
   }
@@ -426,8 +464,74 @@ function renderResult(res){
   }
 }
 
+/* ---------- token 自动获取 ---------- */
+async function refreshCapStatus(){
+  try{
+    const j = await api('/api/capture/status');
+    const cb = $('caBadge');
+    cb.textContent = '证书：' + (j.ca_installed ? '已安装' : '未安装');
+    cb.className = 'badge ' + (j.ca_installed ? 'on' : 'warn');
+    const pb = $('proxyBadge'), px = j.proxy || '';
+    if(!px){
+      pb.textContent = '代理：未设置'; pb.className = 'badge';
+    } else if(px.indexOf('8899') >= 0){
+      pb.textContent = '代理：本机 8899（抓包中）'; pb.className = 'badge on';
+    } else {
+      pb.textContent = '代理：' + px + ' ⚠ 可能被 Fiddler 占用';
+      pb.className = 'badge warn';
+      pb.title = '检测到其他代理（8888 通常是 Fiddler）。抓包时建议先关闭 Fiddler，否则它会把系统代理抢回去。';
+    }
+  }catch(e){}
+}
+$('btnLogin').onclick = async ()=>{
+  const u = $('luser').value.trim(), p = $('lpwd').value;
+  if(!u || !p){ toast('请填学号和密码'); return; }
+  $('btnLogin').disabled = true; $('btnLogin').textContent = '登录中…';
+  try{
+    const r = await api('/api/caslogin', {username:u, password:p});
+    if(r.mfa){
+      toast('需要多因子认证，请看下方提示');
+      appendLogLine('△ 密码正确，但账号开了多因子认证（MFA）');
+      appendLogLine('  ' + (r.msg||''));
+      appendLogLine('  也可改用下面的「抓包」方式，在浏览器里完成 MFA。');
+    } else if(r.ok){
+      $('token').value = r.token;
+      await api('/api/config', collect());
+      toast(r.valid ? '✓ 登录成功，token 已填入' : '拿到 token 但校验未通过：' + (r.why||''));
+      $('lpwd').value = '';
+      appendLogLine(r.valid
+        ? `✓ 登录成功，token ${r.preview} 已写入配置`
+        : `△ 登录返回了 token，但校验失败：${r.why}`);
+    } else {
+      toast(r.msg || '登录失败');
+      appendLogLine('× 登录失败：' + (r.msg||''));
+    }
+  }catch(e){ toast('请求失败'); }
+  $('btnLogin').disabled = false; $('btnLogin').textContent = '🔑 登录并获取 token';
+};
+$('btnCap').onclick = async ()=>{
+  const r = await api('/api/capture', {capture_timeout: 300});
+  if(!r.ok){ toast(r.msg||'启动失败'); return; }
+  begin();
+};
+$('btnCapStop').onclick = async ()=>{ await api('/api/capture/stop'); toast('已停止并复原代理'); };
+$('btnCaInst').onclick = async ()=>{
+  const r = await api('/api/ca/install', {});
+  toast(r.ok ? '证书已安装（指纹 '+(r.fingerprint||'')+'）' : '安装失败/被取消');
+  refreshCapStatus();
+};
+$('btnCaDel').onclick = async ()=>{
+  await api('/api/ca/remove', {}); toast('证书已移除'); refreshCapStatus();
+};
+function appendLogLine(s){
+  const box = $('log');
+  box.innerHTML += (box.innerHTML ? '\n' : '') + s;
+  box.scrollTop = box.scrollHeight;
+}
+
 /* ---------- 事件 ---------- */
 fillTimes();
+refreshCapStatus();
 fetch('/api/config').then(r=>r.json()).then(apply).catch(()=>apply({}));
 
 $('goNow').onclick   = ()=>start('/api/start_now');

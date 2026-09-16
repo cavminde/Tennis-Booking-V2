@@ -1,0 +1,38 @@
+{
+  "token": "",
+  "target_date": "2026-09-17",
+  "app_user_id": "",
+  "window_start": "18:00",
+  "window_end": "22:00",
+  "court_order": [
+    "4号场",
+    "5号场",
+    "6号场",
+    "7号场",
+    "2号场",
+    "3号场",
+    "1号场"
+  ],
+  "court_enabled": {
+    "1号场": true,
+    "2号场": true,
+    "3号场": true,
+    "4号场": true,
+    "5号场": true,
+    "6号场": true,
+    "7号场": true
+  },
+  "sort_strategy": "court_rand",
+  "anti_collision": true,
+  "passphrase": "",
+  "jitter_ms": 120,
+  "min_interval": 0.12,
+  "burst": 3,
+  "scout_workers": 7,
+  "refresh_rounds": 4,
+  "not_open_max_retries": 120,
+  "unknown_max_retries": 3,
+  "schedule": "07:59:58",
+  "one_per_day": true,
+  "max_days_ahead": 2
+}
